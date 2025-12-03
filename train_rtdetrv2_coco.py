@@ -664,7 +664,7 @@ def parse_args():
         '--augmentation',
         type=str,
         default='none',
-        choices=['none', 'flip', 'rotation', 'shear', 'hsv', 'blur', 'noise', 'mosaic', 'cutmix', 'shear_mosaic', 'all'],
+        choices=['none', 'flip', 'rotation', 'shear', 'hsv', 'blur', 'noise', 'mosaic', 'cutmix', 'all'],
         help='Augmentation preset for model soup training'
     )
 
@@ -865,7 +865,7 @@ Example runs for model soup:
 5. HSV/Color only:   python train_rtdetrv2_coco.py --augmentation hsv
 6. Blur only:        python train_rtdetrv2_coco.py --augmentation blur
 7. Noise only:       python train_rtdetrv2_coco.py --augmentation noise
-8. Shear + Mosaic:   python train_rtdetrv2_coco.py --augmentation shear_mosaic
+8. Mosaic only: python train_rtdetrv2.py --augmentation mosaic
 9. All combined:     python train_rtdetrv2_coco.py --augmentation all
 
 Each run will save to: {output_dir}/rtdetr_{augmentation}/final_model

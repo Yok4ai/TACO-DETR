@@ -24,7 +24,7 @@ from pycocotools.cocoeval import COCOeval
 import albumentations as A
 
 
-def cutmix_augmentation(image1, boxes1, labels1, image2, boxes2, labels2, p=0.5, min_bbox_area_ratio=0.1):
+def cutmix_augmentation(image1, boxes1, labels1, image2, boxes2, labels2, p=0.3, min_bbox_area_ratio=0.1):
     """
     Apply YOLO-style CutMix augmentation: cuts a region from image2 and pastes onto image1.
 
@@ -225,28 +225,14 @@ def get_augmentation_preset(preset_name="none", img_size=640):
             ),
         ]
 
-    elif preset_name == "shear_mosaic":
-        # Run 7: Shear + Mosaic combined
-        aug_transforms = [
-            A.Affine(shear=(-5, 5), mode=0, cval=(114, 114, 114), p=0.3),
-            A.Mosaic(
-                grid_yx=(2, 2),
-                target_size=(img_size, img_size),
-                cell_shape=(int(img_size * 0.6), int(img_size * 0.6)),
-                center_range=(0.3, 0.7),
-                fit_mode="cover",
-                p=0.5
-            ),
-        ]
-
     elif preset_name == "all":
         # All augmentations combined (for baseline comparison)
         # Includes Flip, Rotation, Shear, HSV, Blur, and Mosaic
         # Note: CutMix is handled separately in the training loop
         aug_transforms = [
             A.HorizontalFlip(p=0.5),
-            A.Rotate(limit=45, border_mode=0, value=(114, 114, 114), p=0.3),
-            A.Affine(shear=(-5, 5), mode=0, cval=(114, 114, 114), p=0.3),
+            A.Rotate(limit=45, border_mode=0, value=(114, 114, 114), p=0.5),
+            A.Affine(shear=(-5, 5), mode=0, cval=(114, 114, 114), p=0.5),
             A.HueSaturationValue(
                 hue_shift_limit=int(0.015 * 180),
                 sat_shift_limit=int(0.7 * 255),
@@ -263,7 +249,7 @@ def get_augmentation_preset(preset_name="none", img_size=640):
                 cell_shape=(int(img_size * 0.6), int(img_size * 0.6)),
                 center_range=(0.3, 0.7),
                 fit_mode="cover",
-                p=0.3  # Lower probability when combined with other augmentations
+                p=0.5  # Lower probability when combined with other augmentations
             ),
         ]
 
@@ -762,7 +748,7 @@ def parse_args():
         '--augmentation',
         type=str,
         default='none',
-        choices=['none', 'flip', 'rotation', 'shear', 'hsv', 'blur', 'noise', 'mosaic', 'shear_mosaic', 'all'],
+        choices=['none', 'flip', 'rotation', 'shear', 'hsv', 'blur', 'noise', 'mosaic', 'cutmix', 'all'],
         help='Augmentation preset for model soup training'
     )
 
