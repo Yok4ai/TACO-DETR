@@ -13,6 +13,4 @@ yolo_dataset/
 *.ckpt
 .ipynb_checkpoints/
 
-visualizations/
-
 
