@@ -12,22 +12,137 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
 import torch
 import yaml
+import numpy as np
 from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import RTDetrV2ForObjectDetection, RTDetrImageProcessor, Trainer, TrainingArguments, TrainerCallback
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
+import albumentations as A
+
+
+def get_augmentation_preset(preset_name="none", img_size=640):
+    """
+    Get augmentation pipeline for different strategies (model soup approach)
+
+    Args:
+        preset_name: One of ['none', 'flip', 'rotation', 'shear', 'hsv', 'mosaic', 'cutmix', 'shear_mosaic', 'all']
+        img_size: Target image size (not used since RT-DETR processor handles resizing)
+    """
+
+    # Note: No base transforms - RT-DETR processor handles resizing/padding
+    # We only apply augmentations here
+    aug_transforms = []
+
+    if preset_name == "flip":
+        # Run 1: Flip Only
+        aug_transforms = [
+            A.HorizontalFlip(p=0.5),
+        ]
+
+    elif preset_name == "rotation":
+        # Run 2: Rotation Only
+        aug_transforms = [
+            A.Rotate(limit=45, border_mode=0, value=(114, 114, 114), p=0.5),
+        ]
+
+    elif preset_name == "shear":
+        # Run 3: Shear Only
+        aug_transforms = [
+            A.Affine(shear=(-5, 5), mode=0, cval=(114, 114, 114), p=0.5),
+        ]
+
+    elif preset_name == "hsv":
+        # Run 4: HSV/Color Only
+        aug_transforms = [
+            A.HueSaturationValue(
+                hue_shift_limit=int(0.015 * 180),  # 0.015 in YOLO = ~2.7 degrees
+                sat_shift_limit=int(0.7 * 255),     # 0.7 in YOLO
+                val_shift_limit=int(0.4 * 255),     # 0.4 in YOLO
+                p=0.5
+            ),
+            A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.7, hue=0.015, p=0.5),
+        ]
+
+    elif preset_name == "blur":
+        # Additional: Blur augmentation
+        aug_transforms = [
+            A.OneOf([
+                A.MotionBlur(blur_limit=7, p=1.0),
+                A.GaussianBlur(blur_limit=7, p=1.0),
+                A.MedianBlur(blur_limit=7, p=1.0),
+            ], p=0.3),
+        ]
+
+    elif preset_name == "noise":
+        # Additional: Noise augmentation
+        aug_transforms = [
+            A.OneOf([
+                A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
+                A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=1.0),
+            ], p=0.3),
+        ]
+
+    elif preset_name == "shear_mosaic":
+        # Run 7: Shear + Mosaic combined
+        aug_transforms = [
+            A.Affine(shear=(-5, 5), mode=0, cval=(114, 114, 114), p=0.5),
+            # Note: Mosaic requires special handling (multiple images), implemented separately
+        ]
+
+    elif preset_name == "all":
+        # All augmentations combined (for baseline comparison)
+        aug_transforms = [
+            A.HorizontalFlip(p=0.5),
+            A.Rotate(limit=45, border_mode=0, value=(114, 114, 114), p=0.3),
+            A.Affine(shear=(-5, 5), mode=0, cval=(114, 114, 114), p=0.3),
+            A.HueSaturationValue(
+                hue_shift_limit=int(0.015 * 180),
+                sat_shift_limit=int(0.7 * 255),
+                val_shift_limit=int(0.4 * 255),
+                p=0.5
+            ),
+            A.OneOf([
+                A.MotionBlur(blur_limit=7, p=1.0),
+                A.GaussianBlur(blur_limit=7, p=1.0),
+            ], p=0.2),
+        ]
+
+    elif preset_name == "none":
+        # No augmentation
+        aug_transforms = []
+
+    else:
+        raise ValueError(f"Unknown augmentation preset: {preset_name}")
+
+    # Return None if no augmentations (let RT-DETR processor handle everything)
+    if len(aug_transforms) == 0:
+        return None
+
+    # Combine augmentation transforms
+    transform = A.Compose(
+        aug_transforms,
+        bbox_params=A.BboxParams(
+            format='coco',  # [x, y, width, height]
+            label_fields=['class_labels'],
+            min_area=0,
+            min_visibility=0.3,  # Remove boxes with <30% visibility after augmentation
+        )
+    )
+
+    return transform
 
 
 class YoloDetectionDataset(Dataset):
-    """YOLO format dataset for RT-DETR v2"""
+    """YOLO format dataset for RT-DETR v2 with augmentation support"""
 
-    def __init__(self, img_folder, label_folder, processor, class_names):
+    def __init__(self, img_folder, label_folder, processor, class_names, transform=None):
         self.img_folder = Path(img_folder)
         self.label_folder = Path(label_folder)
         self.processor = processor
         self.class_names = class_names
+        self.transform = transform
 
         # Get all image files
         self.image_files = sorted(list(self.img_folder.glob("*.jpg")) + list(self.img_folder.glob("*.png")))
@@ -39,6 +154,12 @@ class YoloDetectionDataset(Dataset):
         """Convert YOLO format (x_center, y_center, w, h) normalized to COCO format [x, y, width, height] absolute"""
         x_center, y_center, width, height = yolo_bbox
 
+        # Clip YOLO coordinates to [0, 1] to handle floating point errors
+        x_center = np.clip(x_center, 0.0, 1.0)
+        y_center = np.clip(y_center, 0.0, 1.0)
+        width = np.clip(width, 0.0, 1.0)
+        height = np.clip(height, 0.0, 1.0)
+
         # Convert to absolute coordinates
         x_center *= img_width
         y_center *= img_height
@@ -49,11 +170,20 @@ class YoloDetectionDataset(Dataset):
         x = x_center - width / 2
         y = y_center - height / 2
 
+        # Clip to valid pixel ranges
+        x = np.clip(x, 0, img_width - 1)
+        y = np.clip(y, 0, img_height - 1)
+
+        # Ensure width/height don't exceed image bounds
+        width = min(width, img_width - x)
+        height = min(height, img_height - y)
+
         return [x, y, width, height]
 
     def __getitem__(self, idx):
         img_path = self.image_files[idx]
         image = Image.open(img_path).convert("RGB")
+        image_np = np.array(image)
         img_width, img_height = image.size
 
         # Load corresponding label file
@@ -75,6 +205,24 @@ class YoloDetectionDataset(Dataset):
 
                         boxes.append(coco_bbox)
                         labels.append(class_id)
+
+        # Apply augmentations if specified
+        if self.transform is not None and len(boxes) > 0:
+            transformed = self.transform(
+                image=image_np,
+                bboxes=boxes,
+                class_labels=labels
+            )
+            image_np = transformed['image']
+            boxes = list(transformed['bboxes'])
+            labels = list(transformed['class_labels'])
+        elif self.transform is not None:
+            # No boxes, just transform image
+            transformed = self.transform(image=image_np, bboxes=[], class_labels=[])
+            image_np = transformed['image']
+
+        # Convert back to PIL for processor
+        image = Image.fromarray(image_np)
 
         # Prepare target in COCO format
         target = {
@@ -140,6 +288,12 @@ class YoloToCoco:
                             class_id = int(parts[0])
                             x_center, y_center, width, height = [float(x) for x in parts[1:5]]
 
+                            # Clip YOLO coordinates to [0, 1] to handle floating point errors
+                            x_center = np.clip(x_center, 0.0, 1.0)
+                            y_center = np.clip(y_center, 0.0, 1.0)
+                            width = np.clip(width, 0.0, 1.0)
+                            height = np.clip(height, 0.0, 1.0)
+
                             # Convert to absolute COCO format [x, y, width, height]
                             x_center *= img_width
                             y_center *= img_height
@@ -148,6 +302,12 @@ class YoloToCoco:
 
                             x = x_center - width / 2
                             y = y_center - height / 2
+
+                            # Clip to valid pixel ranges
+                            x = np.clip(x, 0, img_width - 1)
+                            y = np.clip(y, 0, img_height - 1)
+                            width = min(width, img_width - x)
+                            height = min(height, img_height - y)
 
                             annotations.append({
                                 "id": ann_id,
@@ -297,14 +457,32 @@ CONFIG = {
     "model_name": "PekingU/rtdetr_v2_r50vd",
     "epochs": 50,
     "batch_size": 8,
-    "learning_rate": 1e-4,  # Increased from 1e-5 for better convergence
+    "learning_rate": 1e-4,
+    "img_size": 640,
+
+    # ========== AUGMENTATION PRESET ==========
+    # Options: 'none', 'flip', 'rotation', 'shear', 'hsv', 'blur', 'noise', 'shear_mosaic', 'all'
+    # Change this for different model soup runs
+    "augmentation": "flip",  # <-- CHANGE THIS FOR EACH RUN
+
+    # Run name for output directory (auto-generated from augmentation if not set)
+    "run_name": None,
 }
+
+# Generate run name if not specified
+if CONFIG["run_name"] is None:
+    CONFIG["run_name"] = f"rtdetr_{CONFIG['augmentation']}"
+
+# Update output directory with run name
+OUTPUT_DIR = f"{OUTPUT_DIR}/{CONFIG['run_name']}"
 
 print("=" * 80)
 print("RT-DETR v2 Training Pipeline (YOLO Format)")
 print("=" * 80)
 print(f"Dataset: {DATASET_ROOT}")
 print(f"Model: {CONFIG['model_name']}")
+print(f"Augmentation: {CONFIG['augmentation']}")
+print(f"Run name: {CONFIG['run_name']}")
 print(f"Device: {'GPU' if torch.cuda.is_available() else 'CPU'}")
 if torch.cuda.is_available():
     print(f"GPU Count: {torch.cuda.device_count()}")
@@ -334,19 +512,29 @@ model = RTDetrV2ForObjectDetection.from_pretrained(
     ignore_mismatched_sizes=True
 )
 
+# Create augmentation transforms
+train_transform = get_augmentation_preset(CONFIG['augmentation'], CONFIG['img_size'])
+val_transform = get_augmentation_preset('none', CONFIG['img_size'])  # No augmentation for validation
+
+print(f"Train augmentation: {CONFIG['augmentation']}")
+print(f"Validation augmentation: none (resize only)")
+print()
+
 # Create datasets
 train_dataset = YoloDetectionDataset(
     img_folder=dataset_root / "train" / "images",
     label_folder=dataset_root / "train" / "labels",
     processor=processor,
-    class_names=class_names
+    class_names=class_names,
+    transform=train_transform
 )
 
 val_dataset = YoloDetectionDataset(
     img_folder=dataset_root / "valid" / "images",
     label_folder=dataset_root / "valid" / "labels",
     processor=processor,
-    class_names=class_names
+    class_names=class_names,
+    transform=val_transform
 )
 
 # Create COCO format for evaluation
@@ -428,3 +616,45 @@ with open(f"{OUTPUT_DIR}/metrics.json", 'w') as f:
 print(f"\nModel saved to: {OUTPUT_DIR}/final_model")
 print(f"Metrics saved to: {OUTPUT_DIR}/metrics.json")
 print(f"Tracked {len(coco_callback.epoch_metrics)} epochs")
+
+
+# ============================================================================
+# MODEL SOUP INSTRUCTIONS
+# ============================================================================
+"""
+To create a model soup ensemble, run this script multiple times with different
+augmentation presets. Simply change the CONFIG["augmentation"] value above.
+
+Example runs for model soup:
+
+1. Flip only:        CONFIG["augmentation"] = "flip"
+2. Rotation only:    CONFIG["augmentation"] = "rotation"
+3. Shear only:       CONFIG["augmentation"] = "shear"
+4. HSV/Color only:   CONFIG["augmentation"] = "hsv"
+5. Blur only:        CONFIG["augmentation"] = "blur"
+6. Noise only:       CONFIG["augmentation"] = "noise"
+7. Shear + Mosaic:   CONFIG["augmentation"] = "shear_mosaic"
+8. All combined:     CONFIG["augmentation"] = "all"
+9. No augmentation:  CONFIG["augmentation"] = "none"
+
+Each run will save to: {OUTPUT_DIR}/rtdetr_{augmentation}/final_model
+
+After training all variants, you can ensemble them using:
+- Weighted averaging of model parameters
+- Test-time averaging of predictions
+- Stacking/voting strategies
+
+Available augmentation presets:
+- 'none': No augmentation (baseline)
+- 'flip': Horizontal flip only (p=0.5)
+- 'rotation': Rotation ±45° (p=0.5)
+- 'shear': Affine shear ±5° (p=0.5)
+- 'hsv': Color jitter (HSV augmentation)
+- 'blur': Motion/Gaussian/Median blur (p=0.3)
+- 'noise': Gaussian/ISO noise (p=0.3)
+- 'shear_mosaic': Shear + Mosaic combined
+- 'all': All augmentations combined (strong baseline)
+
+Tip: Keep CONFIG["epochs"], "batch_size", and "learning_rate" consistent
+across all runs for fair model soup comparison.
+"""
